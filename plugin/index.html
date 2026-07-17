@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>swamp bridge</title>
+    <style>
+      body { font: 13px/1.5 system-ui, sans-serif; margin: 0; padding: 12px; color: #ccc; background: #1e1e1e; }
+      h1 { font-size: 14px; margin: 0 0 6px; }
+      code { background: #2a2a2a; padding: 1px 4px; border-radius: 3px; }
+      .muted { color: #888; }
+    </style>
+  </head>
+  <body>
+    <h1>@kneel/super-productivity — swamp bridge</h1>
+    <p class="muted">
+      Signed file-IPC bridge (HMAC per plan §3/§4). Polls
+      <code>~/.var/app/…/super-productivity-swamp/plugin_commands/</code> and writes
+      signed responses. Separate bridge dir from other MCP plugins.
+    </p>
+    <p class="muted">Status is logged to the SP dev console. This plugin has no UI controls.</p>
+    <script src="plugin.js"></script>
+  </body>
+</html>

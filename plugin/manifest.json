@@ -1,0 +1,16 @@
+{
+  "id": "kneel-super-productivity-swamp",
+  "name": "swamp bridge (@kneel/super-productivity)",
+  "description": "Signed file-IPC bridge so the swamp @kneel/super-productivity model can drive Super Productivity. HMAC-authenticated per plan §3/§4. Uses its OWN bridge dir (super-productivity-swamp), separate from any other MCP plugin, so it coexists with b0x42's bridge without contention.",
+  "version": "0.1.13",
+  "manifestVersion": 1,
+  "author": "kneel",
+  "homepage": "https://github.com/NeilHanlon/swamp-super-productivity",
+  "minSupVersion": "14.0.0",
+  "permissions": [
+    "nodeExecution"
+  ],
+  "iFrame": true,
+  "isSkipMenuEntry": true,
+  "hooks": []
+}

@@ -1,0 +1,78 @@
+manifestVersion: 1
+name: "@kneel/super-productivity"
+version: "2026.07.16.4"
+description: |
+  Make [Super Productivity](https://super-productivity.com/) a node in the swamp
+  automation graph — headless task/project/tag reads and writes over a signed
+  file-IPC bridge to a first-party SP plugin, with an HMAC auth layer the
+  community bridges lack. The swamp model is the "server" half: an ephemeral
+  method writes a signed command file and polls for the signed response; the
+  long-lived plugin (single-writer `.bridge_lock`) verifies-before-parse, dedups
+  on execute, and rejects (never defers) over-budget commands.
+
+  Not a clone of the SP-MCP tool surface — this exposes SP as CEL-referenceable
+  swamp resources (`tasks`, `projects`, `tags`, `currentTask`, `worklog`,
+  `batchResult`) so workflows and other models can wire into your task manager.
+
+  ## Methods
+
+  - **provision** — write the plugin's 0600 `.auth_token` copy of
+    `{v,secret,instance}` from the vault; create the bridge dirs. Idempotent.
+  - **sync** — Rule-6 fan-out: ONE execution pulls tasks+projects+tags and writes
+    all three as separate CEL-referenceable resources (avoids lock contention).
+  - **get_tasks** / **get_current_task** / **get_worklog** — reads (privacy-filtered).
+  - **create_task** — `addTask`; supports `parentId` for single-call subtask
+    creation (SP inherits the parent's project/tags), plus `addToToday`/`dueDay`.
+  - **update_task** / **complete_task** — patch fields / mark done.
+  - **log_time** — log/adjust time on a task for a day by writing SP's canonical
+    `timeSpentOnDay` via `updateTask` (derived `timeSpent` recomputes; child→parent
+    rollup is automatic). `mode: add|set`; durations in milliseconds.
+  - **plan_for_today** / **remove_from_today** — SP's real Today mechanism
+    (`dueDay` + the `TODAY` tag's ordered `taskIds`), with subtask→parent anchoring.
+  - **batch** — Rule-6 fan-out over `batchUpdateForProject`: N create/update/delete/
+    reorder ops in ONE dispatch, surfacing `{createdTaskIds, errors}` as `batchResult`.
+  - **delete_task** — permanently delete a task (destructive; verify the id first).
+  - **create_tag** / **update_tag** / **create_project** / **update_project** — structure.
+  - **notify** — fire a native OS notification via SP (workflow primitive).
+
+  ## Quickstart
+
+  ```bash
+  # 1. store the HMAC secret + instance uuid in a vault, then:
+  swamp model create @kneel/super-productivity sp \
+    --global-arg dataDir=/path/to/super-productivity-swamp \
+    --global-arg authSecret='${{ vault.get(super-productivity, secret) }}' \
+    --global-arg authInstance='${{ vault.get(super-productivity, instance) }}'
+  swamp model method run sp provision      # write the plugin's token copy
+  # 2. import plugin/sp-swamp-plugin.zip into Super Productivity, enable it, restart SP
+  swamp model method run sp sync           # tasks-main / projects-main / tags-main
+  ```
+
+  Reference the data with CEL (prefer `data.latest(...)`; 2nd arg is the instance):
+
+  ```
+  data.latest("sp", "tasks-main").attributes.tasks
+  ```
+
+  The signed-bridge plugin (`plugin/`, importable zip `plugin/sp-swamp-plugin.zip`)
+  and the full design/security docs (`docs/`) travel with this extension. Bridge
+  wire contract and hardening are documented in `docs/super-productivity-plan.md`.
+  Full docs: https://github.com/NeilHanlon/swamp-superproductivity
+repository: "https://github.com/NeilHanlon/swamp-superproductivity"
+paths:
+  base: manifest
+models:
+  - super_productivity.ts
+  - sp_wire.ts
+binaries:
+  - sp-swamp-plugin.zip
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+  - docs/super-productivity-plan.md
+labels:
+  - super-productivity
+  - task-management
+  - productivity
+  - todo
+  - time-tracking
