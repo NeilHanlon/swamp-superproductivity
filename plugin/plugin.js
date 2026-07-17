@@ -412,6 +412,16 @@
     return { removed: ids, todayCount: kept.length };
   }
 
+  // Fetch a task by id from live state; throw if it doesn't exist (or is archived).
+  // SP's updateTask/deleteTask SILENTLY no-op on an unknown id, so a caller passing a
+  // stale/wrong id would otherwise get a false success and no mutation (the "dings but
+  // task never checked off" bug). Guarding turns that into a clear error. Returns the task.
+  async function _requireTask(id, op) {
+    var all = await PluginAPI.getTasks(); // includes subtasks; excludes archived
+    for (var i = 0; i < all.length; i++) { if (all[i].id === id) return all[i]; }
+    throw new Error(op + ": task not found (or archived): " + id);
+  }
+
   async function dispatch(action, a) {
     switch (action) {
       case "get_snapshot":
@@ -446,6 +456,7 @@
         return { id: id, addedToToday: !!a.addToToday };
       }
       case "update_task": {
+        await _requireTask(a.taskId, "update_task"); // stale id ⇒ error, not silent no-op
         var patch = {};
         ["title", "notes", "projectId", "tagIds", "timeEstimate", "isDone", "dueDay"].forEach(function (k) {
           if (a[k] !== undefined) patch[k] = a[k];
@@ -463,6 +474,7 @@
       case "remove_from_today":
         return await removeFromToday(a.taskIds || (a.taskId ? [a.taskId] : []), !!a.clearDueDay);
       case "complete_task":
+        await _requireTask(a.taskId, "complete_task"); // stale id ⇒ error, not silent no-op
         await PluginAPI.updateTask(a.taskId, { isDone: true, doneOn: Date.now() });
         return { completed: a.taskId };
       // Log/adjust time on a task for a given day. SP's canonical unit is `timeSpentOnDay`
@@ -475,10 +487,7 @@
           throw new Error("log_time: invalid calendar date: " + a.date);
         }
         var date = a.date || _todayStr();
-        var all = await PluginAPI.getTasks();          // includes subtasks; excludes archived
-        var t = null;
-        for (var i = 0; i < all.length; i++) { if (all[i].id === a.taskId) { t = all[i]; break; } }
-        if (!t) throw new Error("log_time: task not found (or archived): " + a.taskId);
+        var t = await _requireTask(a.taskId, "log_time");
         var spentOnDay = (t.timeSpentOnDay && typeof t.timeSpentOnDay === "object")
           ? Object.assign({}, t.timeSpentOnDay) : {};
         var prev = +spentOnDay[date] || 0;
@@ -508,6 +517,7 @@
         };
       }
       case "delete_task":
+        await _requireTask(a.taskId, "delete_task"); // stale id ⇒ error, not silent no-op
         await PluginAPI.deleteTask(a.taskId);
         return { deleted: a.taskId };
       case "create_tag": {

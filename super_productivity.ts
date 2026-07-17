@@ -406,7 +406,7 @@ function filterExcluded(tasks: unknown, excludeTags: string[]): typeof tasks {
  */
 export const model = {
   type: "@kneel/super-productivity",
-  version: "2026.07.16.4",
+  version: "2026.07.16.5",
   globalArguments: GlobalArgsSchema,
 
   resources: {

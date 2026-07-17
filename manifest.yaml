@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@kneel/super-productivity"
-version: "2026.07.16.4"
+version: "2026.07.16.5"
 description: |
   Make [Super Productivity](https://super-productivity.com/) a node in the swamp
   automation graph — headless task/project/tag reads and writes over a signed
