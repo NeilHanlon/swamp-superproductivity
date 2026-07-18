@@ -66,16 +66,32 @@ switch (kase) {
     });
     const name = `adv_forged_${stamp}.json`;
     await writeCmd(name, env);
-    console.log(JSON.stringify({ kase, name, id, expect: "bad-signature (delete, not counted, no response)" }));
+    console.log(
+      JSON.stringify({
+        kase,
+        name,
+        id,
+        expect: "bad-signature (delete, not counted, no response)",
+      }),
+    );
     break;
   }
 
   // ── c. Stale timestamp: correctly signed, ts = now − 300s ─────────────────
   case "stale": {
-    const { id, env } = goodEnvelope("get_current_task", {}, { ts: nowMs() - 300_000 });
+    const { id, env } = goodEnvelope("get_current_task", {}, {
+      ts: nowMs() - 300_000,
+    });
     const name = `adv_stale_${stamp}.json`;
     await writeCmd(name, env);
-    console.log(JSON.stringify({ kase, name, id, expect: "stale (counted, deleted, no response)" }));
+    console.log(
+      JSON.stringify({
+        kase,
+        name,
+        id,
+        expect: "stale (counted, deleted, no response)",
+      }),
+    );
     break;
   }
 
@@ -86,7 +102,14 @@ switch (kase) {
     });
     const name = `adv_aud_${stamp}.json`;
     await writeCmd(name, env);
-    console.log(JSON.stringify({ kase, name, id, expect: "aud-mismatch (counted, deleted, no response)" }));
+    console.log(
+      JSON.stringify({
+        kase,
+        name,
+        id,
+        expect: "aud-mismatch (counted, deleted, no response)",
+      }),
+    );
     break;
   }
 
@@ -106,7 +129,14 @@ switch (kase) {
     const env: Envelope = { payload, sig: signBytes(kRsp, payload) };
     const name = `adv_crosskey_${stamp}.json`;
     await writeCmd(name, env);
-    console.log(JSON.stringify({ kase, name, id, expect: "bad-signature (wrong subkey for command direction)" }));
+    console.log(
+      JSON.stringify({
+        kase,
+        name,
+        id,
+        expect: "bad-signature (wrong subkey for command direction)",
+      }),
+    );
     break;
   }
 
@@ -120,7 +150,14 @@ switch (kase) {
   case "reflect": {
     const { kCmd, kRsp } = deriveSubkeys(auth.secret);
     const id = mintId();
-    const payloadObj = { v: 1, id, ts: nowMs(), aud: auth.instance, ok: true, result: { spoofed: true } };
+    const payloadObj = {
+      v: 1,
+      id,
+      ts: nowMs(),
+      aud: auth.instance,
+      ok: true,
+      result: { spoofed: true },
+    };
     const payload = JSON.stringify(payloadObj);
     const cmdSig = signBytes(kCmd, payload);
     const rspSig = signBytes(kRsp, payload);
@@ -133,7 +170,8 @@ switch (kase) {
       name,
       id,
       cmdSig_ne_rspSig: cmdSig !== rspSig,
-      expect: "model rejects: k_cmd sig != k_rsp sig; plugin never reads responses/",
+      expect:
+        "model rejects: k_cmd sig != k_rsp sig; plugin never reads responses/",
     }));
     break;
   }
@@ -143,7 +181,14 @@ switch (kase) {
     const { id, env } = goodEnvelope("get_current_task");
     const n1 = `adv_replay_${stamp}_a.json`;
     await writeCmd(n1, env);
-    console.log(JSON.stringify({ kase: "replay-1", name: n1, id, expect: "executes once, writes response" }));
+    console.log(
+      JSON.stringify({
+        kase: "replay-1",
+        name: n1,
+        id,
+        expect: "executes once, writes response",
+      }),
+    );
     // Wait for the plugin to execute + respond, then replay the exact same envelope.
     for (let i = 0; i < 40; i++) {
       await new Promise((r) => setTimeout(r, 250));
@@ -154,7 +199,14 @@ switch (kase) {
     }
     const n2 = `adv_replay_${stamp}_b.json`;
     await writeCmd(n2, env);
-    console.log(JSON.stringify({ kase: "replay-2", name: n2, id, expect: "deduped (skip execute, delete)" }));
+    console.log(
+      JSON.stringify({
+        kase: "replay-2",
+        name: n2,
+        id,
+        expect: "deduped (skip execute, delete)",
+      }),
+    );
     break;
   }
 
@@ -166,7 +218,15 @@ switch (kase) {
       ids.push(id);
       await writeCmd(`adv_rl_${stamp}_${String(i).padStart(2, "0")}.json`, env);
     }
-    console.log(JSON.stringify({ kase, count: ids.length, firstId: ids[0], lastId: ids[34], expect: "30 executed, 5 rate_limited responses" }));
+    console.log(
+      JSON.stringify({
+        kase,
+        count: ids.length,
+        firstId: ids[0],
+        lastId: ids[34],
+        expect: "30 executed, 5 rate_limited responses",
+      }),
+    );
     break;
   }
 

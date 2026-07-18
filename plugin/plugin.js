@@ -29,12 +29,20 @@
 (function () {
   "use strict";
 
+  // Version STAMP (WS7a): build_plugin (super_productivity.ts) replaces this token
+  // with plugin/manifest.json's version when it produces the canonical zip, so the
+  // reported version cannot silently drift from the manifest (SWAMP-3). The literal
+  // token survives in SOURCE (unit/parity tests run against source); only the built
+  // artifact carries a real semver. plugin_status surfaces it as `version`.
+  var PLUGIN_VERSION = "__PLUGIN_VERSION__";
   var BRIDGE_REL = ".var/app/com.super_productivity.SuperProductivity/data/super-productivity-swamp";
   var POLL_MS = 1000;
   var MAX_PER_MIN = 30;
   var DEDUP_RETENTION_MS = 120000; // window + skew
   var DEDUP_CAP = 500; // > MAX_PER_MIN × 2min
   var FRESHNESS_MS = 120000;
+  // DATA verbs → dispatched through the SP PluginAPI (dispatch()). Locked in lockstep
+  // with sp_plugin_core.DEFAULT_ALLOWED by the source-parity test (SWAMP-11).
   var ALLOWED = [
     "get_snapshot", "get_tasks", "get_current_task", "get_worklog",
     "create_task", "update_task", "complete_task", "notify",
@@ -43,6 +51,20 @@
     "batch", "delete_task", "log_time",
     "create_tag", "update_tag", "create_project", "update_project",
   ];
+  // META (control-plane) verbs → dispatched against LOOP STATE (dispatchMeta()),
+  // NEVER the PluginAPI. Rides the IDENTICAL §3/§4 verify pipeline + shared rate/
+  // dedup budget as data; only the allowlist branch + dispatch target differ (WS7a).
+  // Locked to sp_plugin_core.DEFAULT_META_ALLOWED by the parity test. Read-only today.
+  var META_ALLOWED = ["plugin_status"];
+  // A verb's class is decided by which list it is in; an overlap would make a signed
+  // command's dispatch target ambiguous (SEC-1). Mirror the core's load-time assert.
+  (function () {
+    for (var i = 0; i < META_ALLOWED.length; i++) {
+      if (ALLOWED.indexOf(META_ALLOWED[i]) >= 0) {
+        throw new Error("sp-swamp: action '" + META_ALLOWED[i] + "' is in BOTH the data and meta allowlists");
+      }
+    }
+  })();
 
   // ── WS3.5 single-writer lock (bridge-dir `.bridge_lock` heartbeat) ────────────
   // SP gives the plugin a FRESH JS context on every (re)load and does not reliably
@@ -62,6 +84,14 @@
   var isOwner = false; // true only while THIS loop holds the lock and polls.
   var claiming = false; // start() re-entrancy guard (claim is async).
   var reclaimTimer = null; // pending scheduleReclaim() setTimeout handle.
+  // ── WS7a observability state (surfaced by plugin_status, read-only) ───────────
+  var ownedSinceMs = 0; // ms epoch this loop last ACQUIRED the lock; uptimeMs = now - this.
+  //   Documented to RESET on reclaim/promotion — uptime is OWNERSHIP lifetime, not
+  //   iframe lifetime (a promoted watcher starts a fresh ownership clock).
+  var scanCount = 0; // successful SCAN_SRC passes in the CURRENT ownership epoch
+  //   (reset alongside ownedSinceMs on every (re)acquire, so it tracks uptimeMs).
+  var logLevel = "info"; // in-memory verbosity. NO bridge-reachable setter until WS7b
+  //   adds set_log_level under its own META_ALLOWED gate (SEC-6) — reported only.
   // Per-loop identity: a fresh iframe context ⇒ a fresh LOOP_ID. This is what the
   // lock records as `owner`; pid is NOT unique (executeNodeScript loops may share
   // one Node backend process), so ownership is keyed on this token, not pid.
@@ -107,7 +137,7 @@
     const lockPath = path.join(baseDir, '.bridge_lock');
     const CMD_INFO = 'sp-ipc:command:v1', RSP_INFO = 'sp-ipc:response:v1';
 
-    const out = { toExecute: [], rejected: [], rateLimited: [], deduped: [], authError: null, lockLost: false,
+    const out = { toExecute: [], rejected: [], rateLimited: [], deduped: [], authError: null, lockLost: false, lock: null,
                   state: { processedIds: Object.assign({}, stateIn.processedIds), recentVerified: stateIn.recentVerified.slice() } };
 
     // ── WS3.5 heartbeat + ownership self-check (single-writer) ──
@@ -126,6 +156,9 @@
         fs.writeFileSync(lt, JSON.stringify(lk));
         fs.renameSync(lt, lockPath);
       } catch (e) {}
+      // WS7a: thread the just-refreshed lock snapshot back so dispatchMeta can compute
+      // an HONEST ageMs at dispatch time (age = now - heartbeatAt), not a stale one.
+      out.lock = { owner: lk.owner, heartbeatAt: lk.heartbeatAt, startedAt: lk.startedAt };
     }
 
     function hexEqual(a, b) {
@@ -203,13 +236,20 @@
       }
       // Dedup CHECK (idempotent): already executed ⇒ skip + delete replay.
       if (Object.prototype.hasOwnProperty.call(out.state.processedIds, p.id)) { out.deduped.push(p.id); del(fp); continue; }
-      // Allowlist.
-      if (cfg.allowed.indexOf(p.action) < 0) {
+      // Allowlist + class decision (WS7a, mirrors sp_plugin_core.processCommands).
+      // Decide the command's class ONCE here, where the fully-verified action is
+      // available: data verbs → dispatch (PluginAPI), meta verbs → dispatchMeta
+      // (loop state). Data is checked first, so a (load-asserted-impossible) overlap
+      // routes deterministically to data. A verb in NEITHER list is forbidden.
+      const isData = cfg.allowed.indexOf(p.action) >= 0;
+      const isMeta = !isData && (cfg.metaAllowed || []).indexOf(p.action) >= 0;
+      if (!isData && !isMeta) {
         writeResp(rec.secret, rec.instance, p.id, false, { error: { code: 'forbidden_action', action: p.action } });
         out.rejected.push({ name: name, reason: 'forbidden_action' }); del(fp); continue;
       }
-      // Passed: hand to the iframe to dispatch. (File deleted after response in phase 3.)
-      out.toExecute.push({ id: p.id, action: p.action, args: p.args || {}, file: name });
+      // Passed: hand to the iframe to dispatch, CARRYING the decided class so tick()
+      // routes off the carried tag (no re-derivation). File deleted after response (phase 3).
+      out.toExecute.push({ id: p.id, action: p.action, args: p.args || {}, file: name, cls: isData ? 'data' : 'meta' });
     }
     // DEBUG-G3: APPEND per-scan trace (one JSON object per line) so we don't lose
     // the scan that actually consumed the file. Overwrite was useless — the next
@@ -269,7 +309,7 @@
 
   var scanCfg = {
     bridgeRel: BRIDGE_REL, loopId: LOOP_ID, maxPerMin: MAX_PER_MIN, retentionMs: DEDUP_RETENTION_MS,
-    cap: DEDUP_CAP, freshnessMs: FRESHNESS_MS, allowed: ALLOWED,
+    cap: DEDUP_CAP, freshnessMs: FRESHNESS_MS, allowed: ALLOWED, metaAllowed: META_ALLOWED,
   };
 
   // ── WS3.5 lock claim (Node): atomic single-writer acquisition ─────────────────
@@ -539,6 +579,41 @@
     }
   }
 
+  // ── Meta (control-plane) dispatch (WS7a) ──────────────────────────────────────
+  // Routed here ONLY for verbs in META_ALLOWED (decided at the SCAN_SRC allowlist
+  // step, carried as cls:'meta'). Reads ONLY in-context LOOP STATE — never the
+  // PluginAPI, never fs. `lockSnap` is the per-tick heartbeat snapshot threaded from
+  // SCAN_SRC; ageMs is computed HERE, at dispatch time, so freshness is honest even
+  // if the tick was slow (SEC-8). Read-only today; WS7b/WS7c add mutating verbs.
+  async function dispatchMeta(action, args, lockSnap) {
+    switch (action) {
+      case "plugin_status": {
+        var now = Date.now();
+        var hb = (lockSnap && typeof lockSnap.heartbeatAt === "number") ? lockSnap.heartbeatAt : null;
+        var ageMs = hb != null ? (now - hb) : null;
+        return {
+          version: PLUGIN_VERSION,
+          loopId: LOOP_ID,
+          // Always true today: only the lock owner ever dispatches, so a plugin_status
+          // that runs at all runs in the owner. Kept for WS7c multi-loop symmetry.
+          isOwner: isOwner,
+          uptimeMs: ownedSinceMs ? (now - ownedSinceMs) : 0,
+          scanCount: scanCount,
+          pollMs: POLL_MS,
+          logLevel: logLevel,
+          lock: {
+            owner: lockSnap ? (lockSnap.owner || null) : null,
+            heartbeatAt: hb,
+            ageMs: ageMs,
+            stale: ageMs != null ? (ageMs > LOCK_STALE_MS) : true,
+          },
+        };
+      }
+      default:
+        throw new Error("unknown meta action: " + action);
+    }
+  }
+
   // iframe-land has no fs — every debug write goes through executeNodeScript.
   function dbgAppend(entry) {
     var src = "const fs = require('fs'); const path = require('path'); const os = require('os');" +
@@ -568,6 +643,7 @@
         standDown();
         return;
       }
+      scanCount += 1; // WS7a: a successful owned scan (surfaced by plugin_status)
       if (r.state) state = r.state; // adopt updated rate/dedup state
       if (r.authError) { log("auth:", r.authError); dbgAppend({ phase: "auth_error", msg: r.authError }); return; }
       if (r.rejected && r.rejected.length) log("rejected", r.rejected.length, r.rejected.map(function (x) { return x.reason; }));
@@ -581,9 +657,13 @@
       for (var i = 0; i < toExec.length; i++) {
         var c = toExec[i];
         try {
-          var res = await dispatch(c.action, c.args);
+          // Route off the CARRIED class (decided at the SCAN_SRC allowlist step) —
+          // a trivial tag-switch, no re-derivation. meta → loop state, data → PluginAPI.
+          var res = c.cls === "meta"
+            ? await dispatchMeta(c.action, c.args, r.lock)
+            : await dispatch(c.action, c.args);
           results.push({ id: c.id, file: c.file, ok: true, result: res });
-          dbgAppend({ phase: "dispatch_ok", id: c.id, action: c.action, result: res });
+          dbgAppend({ phase: "dispatch_ok", id: c.id, action: c.action, cls: c.cls, result: res });
         } catch (e) {
           var errMsg = String(e && e.message || e);
           results.push({ id: c.id, file: c.file, ok: false, error: { code: "exec_failed", message: errMsg } });
@@ -660,6 +740,8 @@
         return;
       }
       isOwner = true;
+      ownedSinceMs = Date.now(); // WS7a: start this ownership's uptime clock (resets on promotion)
+      scanCount = 0; // reset with the uptime clock so both count from this acquisition
       if (reclaimTimer) { clearTimeout(reclaimTimer); reclaimTimer = null; }
       log("bridge lock acquired (" + claim.reason + ") — arming poll interval");
       dbgAppend({ phase: "lock_acquired", reason: claim.reason, loopId: LOOP_ID });

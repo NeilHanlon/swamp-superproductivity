@@ -44,7 +44,9 @@ function cmd(overrides: Record<string, unknown> = {}) {
 
 Deno.test("happy path — command round-trips and verifies", () => {
   const env = cmd();
-  const r = verifyEnvelope<CommandPayload>(authA, env, "command", { nowMs: NOW });
+  const r = verifyEnvelope<CommandPayload>(authA, env, "command", {
+    nowMs: NOW,
+  });
   assert.equal(r.ok, true);
   assert.equal(r.payload?.action, "get_tasks");
   assert.equal(r.payload?.aud, authA.instance);
@@ -96,7 +98,9 @@ Deno.test("cross-key forgery is rejected (key isolation)", () => {
 Deno.test("cross-direction reflection is rejected (domain separation §4.3)", () => {
   // A command signed with k_cmd, replayed into the response slot (verified k_rsp).
   const commandEnv = cmd();
-  const asResponse = verifyEnvelope(authA, commandEnv, "response", { nowMs: NOW });
+  const asResponse = verifyEnvelope(authA, commandEnv, "response", {
+    nowMs: NOW,
+  });
   assert.equal(asResponse.ok, false);
   assert.equal(asResponse.reason, "bad-signature");
 
@@ -107,7 +111,9 @@ Deno.test("cross-direction reflection is rejected (domain separation §4.3)", ()
     ok: true,
     result: 1,
   });
-  const asCommand = verifyEnvelope(authA, responseEnv, "command", { nowMs: NOW });
+  const asCommand = verifyEnvelope(authA, responseEnv, "command", {
+    nowMs: NOW,
+  });
   assert.equal(asCommand.ok, false);
   assert.equal(asCommand.reason, "bad-signature");
 });
@@ -187,7 +193,12 @@ Deno.test("response id-mismatch is rejected (response-binds-request §4.2)", () 
 });
 
 Deno.test("malformed envelopes are rejected and NOT counted", () => {
-  for (const bad of [null, 42, "nope", {}, { payload: "x" }, { sig: "y" }, { payload: 1, sig: 2 }]) {
+  for (
+    const bad of [null, 42, "nope", {}, { payload: "x" }, { sig: "y" }, {
+      payload: 1,
+      sig: 2,
+    }]
+  ) {
     const r = verifyEnvelope(authA, bad, "command", { nowMs: NOW });
     assert.equal(r.ok, false, `expected reject for ${JSON.stringify(bad)}`);
     assert.equal(r.reason, "malformed-envelope");

@@ -62,10 +62,24 @@ export interface PluginConfig {
   dedupRetentionMs: number;
   /** Hard cap on the dedup set; MUST stay > rate_limit × window (§4 item 8). */
   dedupCap: number;
-  /** Allowed action names (§4 FIX-10). */
+  /** Allowed DATA action names — routed to io.dispatch (SP PluginAPI) (§4 FIX-10). */
   allowed: Set<string>;
+  /**
+   * Allowed META (control-plane) action names — routed to io.dispatchMeta, which
+   * acts on LOOP STATE, never PluginAPI (WS7a). MUST be disjoint from `allowed`
+   * (a verb's class is decided by which set it is in; overlap ⇒ ambiguous routing).
+   * Meta commands ride the IDENTICAL verify pipeline as data and share the same
+   * rate/dedup budget — the split is only in the allowlist check + dispatch target.
+   */
+  metaAllowed: Set<string>;
 }
 
+// The DATA (PluginAPI) allowlist — the SINGLE SOURCE OF TRUTH the plugin.js
+// `ALLOWED` literal is locked to by the source-parity test (SWAMP-11). Every verb
+// the plugin's `dispatch()` switch handles MUST appear here (and vice-versa); the
+// parity test fails the build on any drift. Was historically stale at the original
+// eight WS1/WS2 reads/writes while plugin.js grew the WS4 breadth verbs — WS7a
+// reconciled the two so the parity lock is meaningful.
 export const DEFAULT_ALLOWED = new Set([
   "get_snapshot",
   "get_tasks",
@@ -75,7 +89,44 @@ export const DEFAULT_ALLOWED = new Set([
   "update_task",
   "complete_task",
   "notify",
+  // WS3 Today mechanism
+  "plan_for_today",
+  "remove_from_today",
+  // WS4 breadth
+  "batch",
+  "delete_task",
+  "log_time",
+  "create_tag",
+  "update_tag",
+  "create_project",
+  "update_project",
 ]);
+
+/** Control-plane verbs (WS7a). Read-only today; WS7b/WS7c add mutating ones. */
+export const DEFAULT_META_ALLOWED = new Set([
+  "plugin_status",
+]);
+
+/**
+ * A data verb and a meta verb must never share a name — routing keys off set
+ * membership, so an overlap would make a signed command's dispatch target
+ * ambiguous (SEC-1). Assert on any (allowed, metaAllowed) pair; called at module
+ * load for the shipped defaults and reusable by callers with custom configs.
+ */
+export function assertDisjointAllowlists(
+  allowed: Set<string>,
+  metaAllowed: Set<string>,
+): void {
+  for (const a of metaAllowed) {
+    if (allowed.has(a)) {
+      throw new Error(
+        `sp_plugin_core: action '${a}' is in BOTH the data and meta allowlists`,
+      );
+    }
+  }
+}
+
+assertDisjointAllowlists(DEFAULT_ALLOWED, DEFAULT_META_ALLOWED);
 
 export function defaultConfig(): PluginConfig {
   return {
@@ -83,6 +134,7 @@ export function defaultConfig(): PluginConfig {
     dedupRetentionMs: 120_000, // 2 min = window + skew
     dedupCap: 500, // > 30/min × 2min = 60
     allowed: DEFAULT_ALLOWED,
+    metaAllowed: DEFAULT_META_ALLOWED,
   };
 }
 
@@ -105,8 +157,18 @@ export interface RawFile {
 
 export interface PluginIO {
   now: () => number;
-  /** Run one allowed action against the SP PluginAPI, returning its result. */
+  /** Run one allowed DATA action against the SP PluginAPI, returning its result. */
   dispatch: (action: string, args: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Run one allowed META action against LOOP STATE (never PluginAPI) (WS7a).
+   * Same signature as `dispatch`; the plugin.js impl closes over loop state and
+   * the per-tick lock snapshot. Optional so existing callers/tests that never
+   * exercise meta verbs need not supply it (a meta verb with no handler throws).
+   */
+  dispatchMeta?: (
+    action: string,
+    args: Record<string, unknown>,
+  ) => Promise<unknown>;
   /** Persist a signed response envelope for the given id (atomic on the real side). */
   writeResponse: (id: string, env: Envelope) => Promise<void>;
   /** Remove a consumed/rejected command file by name. */
@@ -228,8 +290,14 @@ export async function processCommands(
       continue;
     }
 
-    // Allowlist (§4 FIX-10). Signed error response so the model fails fast.
-    if (!cfg.allowed.has(p.action)) {
+    // Allowlist + class decision (§4 FIX-10, WS7a SEC-1). Decide the command's
+    // class ONCE here, where the verified action is available: data verbs route to
+    // io.dispatch (SP PluginAPI), meta verbs to io.dispatchMeta (loop state). A verb
+    // in NEITHER list is forbidden. Data is checked first, so even a (load-asserted-
+    // impossible) overlap routes deterministically to data rather than meta.
+    const isData = cfg.allowed.has(p.action);
+    const isMeta = !isData && cfg.metaAllowed.has(p.action);
+    if (!isData && !isMeta) {
       const env = buildResponseEnvelope(auth, {
         id: p.id,
         ts: now,
@@ -245,7 +313,15 @@ export async function processCommands(
     // Execute, then respond, then INSERT the dedup id (on execute, not receipt).
     let env: Envelope;
     try {
-      const result = await io.dispatch(p.action, p.args);
+      let result: unknown;
+      if (isMeta) {
+        if (!io.dispatchMeta) {
+          throw new Error(`no meta dispatcher for action '${p.action}'`);
+        }
+        result = await io.dispatchMeta(p.action, p.args);
+      } else {
+        result = await io.dispatch(p.action, p.args);
+      }
       env = buildResponseEnvelope(auth, {
         id: p.id,
         ts: io.now(),

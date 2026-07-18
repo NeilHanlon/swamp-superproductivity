@@ -75,6 +75,7 @@ Wire contract and hardening details: `docs/super-productivity-plan.md` (§3/§4)
 | `currentTask` | `currentTask-main`       | Currently-selected task (or null)            |
 | `worklog`     | `worklog-main`           | Time-tracking / worklog snapshot             |
 | `batchResult` | `batchResult-main`       | Last `batch` run: tempId→realId + errors     |
+| `pluginStatus`| `pluginStatus-main`      | Running loop's self-report (version, lock freshness) |
 
 Reference with CEL (prefer `data.latest(name, instance)`):
 
@@ -104,6 +105,40 @@ data.latest("sp", "batchResult-main").attributes.createdTaskIds
 | `delete_task` | Permanently delete a task. **Destructive** — verify the id first. |
 | `create_tag` / `update_tag` / `create_project` / `update_project` | Structure. |
 | `notify` | Fire a native OS notification via SP. |
+| `plugin_status` | Meta channel: the running loop's version + lock freshness → `pluginStatus`. Read-only. |
+| `build_plugin` | Dev build: stamp `manifest.json`'s version into `plugin.js` and produce the canonical zip. |
+
+### Meta channel (`plugin_status`)
+
+`plugin_status` is a **control-plane** command: it rides the *same* signed §3/§4
+envelope as data commands but the plugin routes it to loop state (not the SP
+`PluginAPI`), returning `{version, loopId, isOwner, uptimeMs, scanCount, lock:{owner,
+heartbeatAt, ageMs, stale}, pollMs, logLevel}`. The reported `version` is stamped
+from `manifest.json` by `build_plugin`, so it cannot silently drift from the build.
+
+```bash
+swamp model method run sp plugin_status
+data.latest("sp", "pluginStatus-main").attributes.version
+```
+
+> **Poll cadence:** meta commands share the single **30/min** command budget with
+> data ops (there is no separate meta window — the frozen §3/§4 wire contract stays
+> unchanged). Poll `plugin_status` no faster than **~every 5s (≈12/min)** to leave
+> headroom for real work; a tighter loop can trip the shared `rate_limited` budget.
+
+### Building the plugin (`build_plugin`)
+
+`build_plugin` is the reusable, drift-proof build step: it reads
+`plugin/manifest.json`'s `version` (the single source of truth), stamps it into
+`plugin.js`'s `__PLUGIN_VERSION__` token, and writes the canonical
+`sp-swamp-plugin.zip` (fixed 3-file archive) via a pinned pure-JS zip writer — never
+hand-zipped. After building, **re-import the plugin and restart SP** for the new
+version to take effect (model `.ts` changes are live immediately; plugin-code changes
+need re-import + restart).
+
+```bash
+swamp model method run sp build_plugin   # run from the repo root
+```
 
 ### Time tracking
 
@@ -153,6 +188,13 @@ swamp model method run sp batch \
   error and retry with a fresh id — never a reused id that would self-collide.
 - **Single-writer lock**: only one plugin loop polls the bridge dir; reloaded
   iframes idle as watchers, so plugin reloads don't multiply dedup sets.
+- **Meta channel = same trust boundary**: `plugin_status` (and future meta verbs)
+  traverse the identical HMAC→parse→aud→freshness→id-charset pipeline and share the
+  single rate/dedup budget. The class (`data`/`meta`) is decided once at the allowlist
+  step and the two allowlists are asserted disjoint at load, so no verb can cross to
+  the wrong dispatch target. Residual: an authenticated (secret-holding) poller shares
+  the data budget — the same trust level as flooding data commands, bounded by the
+  shared limit + the documented cadence.
 
 ## Development
 
