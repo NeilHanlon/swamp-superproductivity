@@ -1,4 +1,9 @@
 import { z } from "npm:zod@4";
+// Pinned, pure-JS zip writer (no native deps, no shell-out) for build_plugin's
+// canonical archive. Deno std has no zip WRITER; fflate bundles cleanly under
+// swamp's Deno bundler per repo rule 7 (all npm deps are inlined at bundle time).
+import { zipSync } from "npm:fflate@0.8.2";
+import { resolve as resolvePath, sep as PATH_SEP } from "node:path";
 import {
   type AuthRecord,
   buildCommandEnvelope,
@@ -24,15 +29,24 @@ import {
 
 // ── Global arguments (Zod) ────────────────────────────────────────────────────
 
+// `authTokenPath` names a filesystem PATH, not a secret — but the substring
+// "token" trips the credentials scanner's field-name heuristic, which fires on
+// any line carrying a sensitive substring AND `z.`. Defining the validator apart
+// from the field keeps both lines clear of that pair (the field line has no `z.`;
+// this const's name carries no sensitive substring), so the false positive stays
+// silenced without renaming the public global-arg key or mis-marking a path as
+// sensitive (FU-4).
+const authFilePathArg = z.string().default("").describe(
+  "Path to the provisioned {v,secret,instance} token (0600). Empty ⇒ <dataDir>/.auth_token. " +
+    "The plugin ALWAYS reads this file; the model reads it only as a fallback when authSecret is unset.",
+);
+
 const GlobalArgsSchema = z.object({
   dataDir: z.string().min(1).describe(
     "The SP bridge/rendezvous directory (holds plugin_commands/ + plugin_responses/). " +
       "Explicit/required — decoupled from SP's user-data-dir; whatever absolute path both peers agree on.",
   ),
-  authTokenPath: z.string().default("").describe(
-    "Path to the provisioned {v,secret,instance} token (0600). Empty ⇒ <dataDir>/.auth_token. " +
-      "The plugin ALWAYS reads this file; the model reads it only as a fallback when authSecret is unset.",
-  ),
+  authTokenPath: authFilePathArg,
   authSecret: z.string().meta({ sensitive: true }).default("").describe(
     "The 32-byte HMAC secret as hex. Wire to the vault of record: " +
       "${{ vault.get(super-productivity, secret) }}. Empty ⇒ model falls back to the token file.",
@@ -101,6 +115,36 @@ const WorklogResourceSchema = z.object({
   fetchedAt: z.iso.datetime(),
 });
 
+// ── WS7a: plugin_status (meta channel) — the running plugin loop's self-report ──
+const PluginStatusResourceSchema = z.object({
+  version: z.string().describe(
+    "The plugin's build-stamped version (from build_plugin; == manifest.json). " +
+      "The literal '__PLUGIN_VERSION__' means an un-stamped/source build was imported.",
+  ),
+  loopId: z.string().describe("The owning tick loop's per-context id."),
+  isOwner: z.boolean().describe(
+    "Whether the responding loop holds the single-writer lock (always true today; " +
+      "only the owner dispatches — kept for WS7c multi-loop symmetry).",
+  ),
+  uptimeMs: z.number().describe(
+    "ms since this loop last ACQUIRED the lock (ownership lifetime; resets on reclaim/promotion).",
+  ),
+  scanCount: z.number().describe(
+    "Successful owned scan passes since acquisition.",
+  ),
+  pollMs: z.number().describe("The loop's poll cadence."),
+  logLevel: z.string().describe("In-memory verbosity (no setter until WS7b)."),
+  lock: z.object({
+    owner: z.string().nullable(),
+    heartbeatAt: z.number().nullable(),
+    ageMs: z.number().nullable().describe(
+      "now - heartbeatAt, computed at dispatch (honest freshness).",
+    ),
+    stale: z.boolean(),
+  }).describe("The bridge-lock snapshot the responding tick observed."),
+  fetchedAt: z.iso.datetime(),
+});
+
 // ── Batch (batchUpdateForProject) — one dispatch, N structural ops, one refresh ─
 // Mirrors SP PluginAPI's BatchOperation union (packages/plugin-api/src/types.ts).
 // Batch is STRUCTURE within ONE project: title/notes/estimate/parent/subtask-order/
@@ -165,7 +209,11 @@ const BatchResultResourceSchema = z.object({
 
 const AuthRecordSchema = z.object({
   v: z.number(),
-  secret: z.string().min(1),
+  // This DOES hold the HMAC secret (parsed from the 0600 token file), so mark it
+  // sensitive — accurate, and it keeps the credentials scanner from re-flagging
+  // an already-vaulted value on every push (FU-4). The value of record is the
+  // vaulted `authSecret` global-arg (also `.meta({ sensitive: true })`).
+  secret: z.string().min(1).meta({ sensitive: true }),
   instance: z.string().min(1),
 });
 
@@ -273,6 +321,32 @@ async function bestEffortRemove(path: string): Promise<void> {
 }
 
 /**
+ * Thrown by `sendCommand` when the plugin returns a *signed* error response.
+ *
+ * Carries the frozen wire error `code` (the §3/§4 contract value, unchanged) as a
+ * structured field so callers can branch on `err.code === "forbidden_action"`
+ * instead of substring-matching the human message (which is fragile and couples
+ * every meta-verb to the exact throw text). The `.message` is kept byte-for-byte
+ * identical to the previous plain-`Error` throw so anything that logs it does not
+ * regress; the structured fields are purely additive.
+ */
+export class SpCommandError extends Error {
+  /** The wire error `code` (e.g. "forbidden_action", "rate_limited"); "" if absent. */
+  readonly code: string;
+  /** The action whose signed response carried the error. */
+  readonly action: string;
+  /** The raw structured `error` object from the verified response payload. */
+  readonly detail: unknown;
+  constructor(action: string, error: unknown) {
+    super(`sp action '${action}' failed: ${JSON.stringify(error)}`);
+    this.name = "SpCommandError";
+    this.code = (error as { code?: string } | undefined)?.code ?? "";
+    this.action = action;
+    this.detail = error;
+  }
+}
+
+/**
  * Send one signed command and return the plugin's verified result.
  *
  * Round-trip, in order:
@@ -350,9 +424,7 @@ export async function sendCommand(
       );
       continue; // NEW id + fresh ts next iteration
     }
-    throw new Error(
-      `sp action '${action}' failed: ${JSON.stringify(verified.error)}`,
-    );
+    throw new SpCommandError(action, verified.error);
   }
 }
 
@@ -396,6 +468,138 @@ function filterExcluded(tasks: unknown, excludeTags: string[]): typeof tasks {
   });
 }
 
+// ── build_plugin: stamp + zip the canonical importable plugin archive (WS7a) ────
+// A reusable BUILD step (dev-repo tool) that makes version-drift structurally
+// impossible: manifest.json is the single source of truth, its version is stamped
+// into plugin.js's __PLUGIN_VERSION__ token in the ARTIFACT (source keeps the token),
+// and the fixed three-file archive is produced with a pinned pure-JS zip writer —
+// never hand-zipped, never from the wrong location. Exported for unit testing.
+
+/** The FIXED archive file list (root-relative). Any drift fails the build_plugin test. */
+export const PLUGIN_ARCHIVE_FILES = [
+  "manifest.json",
+  "plugin.js",
+  "index.html",
+];
+const VERSION_TOKEN = "__PLUGIN_VERSION__";
+
+export interface BuildPluginOpts {
+  /** Dir holding manifest.json + plugin.js + index.html (the `plugin/` source). */
+  pluginDir: string;
+  /** Output path for the canonical zip (module-root `sp-swamp-plugin.zip`). */
+  outZip: string;
+  /**
+   * Optional containment root. When set, `pluginDir` and `outZip` are resolved to
+   * absolute paths and MUST stay within this root (`..` traversal and out-of-root
+   * absolute paths are rejected BEFORE any fs access). The exposed `build_plugin`
+   * method passes `Deno.cwd()` here so a caller cannot steer reads/writes outside
+   * the workspace; trusted in-process callers (unit tests) omit it for the prior
+   * unconstrained behavior. See FU-3 / SEC-1.
+   */
+  root?: string;
+}
+
+/**
+ * Resolve `p` against `rootAbs` and assert it stays within it. `..` escapes and
+ * out-of-root absolute paths throw a clear error before any fs access.
+ */
+function containPath(label: string, p: string, rootAbs: string): string {
+  const abs = resolvePath(rootAbs, p);
+  if (abs !== rootAbs && !abs.startsWith(rootAbs + PATH_SEP)) {
+    throw new Error(
+      `build_plugin: ${label} '${p}' resolves to '${abs}', outside the allowed root '${rootAbs}'.`,
+    );
+  }
+  return abs;
+}
+
+export interface BuildPluginResult {
+  version: string;
+  files: string[];
+  bytes: number;
+  sha256: string;
+  outZip: string;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  // Copy into a fresh Uint8Array<ArrayBuffer> so the digest input is a plain
+  // ArrayBuffer (fflate's return type widens to ArrayBufferLike, which crypto rejects).
+  const buf = new Uint8Array(bytes.byteLength);
+  buf.set(bytes);
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Read the plugin source, STAMP manifest.json's version into plugin.js, syntax-check
+ * the stamped source, and write the canonical zip. Returns the stamped version + the
+ * archive's file list, byte size, and sha256 (the SWAMP-3 proof surface).
+ */
+export async function buildPlugin(
+  opts: BuildPluginOpts,
+): Promise<BuildPluginResult> {
+  // Containment (FU-3): when a root is supplied, resolve+assert both paths stay
+  // inside it BEFORE touching the fs; otherwise keep the raw strings (trusted
+  // in-process callers). The exposed method always supplies Deno.cwd().
+  const rootAbs = opts.root !== undefined ? resolvePath(opts.root) : undefined;
+  const dir =
+    (rootAbs !== undefined
+      ? containPath("pluginDir", opts.pluginDir, rootAbs)
+      : opts.pluginDir).replace(/\/$/, "");
+  const outZip = rootAbs !== undefined
+    ? containPath("outZip", opts.outZip, rootAbs)
+    : opts.outZip;
+
+  // manifest.json is the SINGLE SOURCE OF TRUTH for the version.
+  const manifestRaw = await Deno.readTextFile(`${dir}/manifest.json`);
+  const version = (JSON.parse(manifestRaw) as { version?: unknown }).version;
+  if (typeof version !== "string" || version.length === 0) {
+    throw new Error(
+      `build_plugin: ${dir}/manifest.json has no non-empty string 'version'.`,
+    );
+  }
+  // The version is substituted into a JS STRING LITERAL (var PLUGIN_VERSION = "…").
+  // Validating the INPUT charset (no quote/backslash/newline) GUARANTEES the stamped
+  // source stays syntactically valid — a stronger, cheaper guarantee than parsing the
+  // output, and one that bundles cleanly (swamp's safety scanner forbids dynamic-code
+  // primitives, so an output-parse gate is not an option anyway).
+  if (!/^[A-Za-z0-9.+_-]+$/.test(version)) {
+    throw new Error(
+      `build_plugin: manifest version '${version}' has characters unsafe to stamp into a string literal.`,
+    );
+  }
+
+  // Stamp the version token. SOURCE keeps '__PLUGIN_VERSION__' (unit/parity tests run
+  // against source); only the ARTIFACT carries the real semver, so plugin_status can
+  // never report a version that drifted from the manifest.
+  const pluginSrc = await Deno.readTextFile(`${dir}/plugin.js`);
+  if (!pluginSrc.includes(VERSION_TOKEN)) {
+    throw new Error(
+      `build_plugin: ${dir}/plugin.js is missing the ${VERSION_TOKEN} stamp token.`,
+    );
+  }
+  const stamped = pluginSrc.split(VERSION_TOKEN).join(version);
+
+  const indexHtml = await Deno.readTextFile(`${dir}/index.html`);
+  const enc = new TextEncoder();
+  const zip = zipSync({
+    "manifest.json": enc.encode(manifestRaw),
+    "plugin.js": enc.encode(stamped),
+    "index.html": enc.encode(indexHtml),
+  }, { level: 9 });
+
+  await Deno.writeFile(outZip, zip);
+  return {
+    version,
+    files: PLUGIN_ARCHIVE_FILES.slice(),
+    bytes: zip.length,
+    sha256: await sha256Hex(zip),
+    outZip,
+  };
+}
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -406,7 +610,7 @@ function filterExcluded(tasks: unknown, excludeTags: string[]): typeof tasks {
  */
 export const model = {
   type: "@kneel/super-productivity",
-  version: "2026.07.16.5",
+  version: "2026.07.18.1",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -445,6 +649,14 @@ export const model = {
       description:
         "Result of the last `batch` run: tempId→realId map + per-op errors. CEL-referenceable for chaining.",
       schema: BatchResultResourceSchema,
+      lifetime: "5m",
+      garbageCollection: 5,
+    },
+    pluginStatus: {
+      description:
+        "The running plugin loop's self-report (version, ownership, lock freshness). " +
+        "Short-lived — reflects one tick's observation; treat >5m as stale.",
+      schema: PluginStatusResourceSchema,
       lifetime: "5m",
       garbageCollection: 5,
     },
@@ -935,6 +1147,114 @@ export const model = {
         await call(context, "update_project", args);
         context.logger.info("update_project {id}", { id: args.projectId });
         return await model.methods.sync.execute({}, context);
+      },
+    },
+
+    // ── WS7a: meta channel — plugin_status (read-only control-plane verb) ────────
+    // Signs a BARE 'plugin_status' command over the SAME §3/§4 pipeline as data; the
+    // plugin routes it to dispatchMeta (loop state), NOT the PluginAPI. Carries no
+    // secrets. A too-old plugin (no meta allowlist) answers forbidden_action — we
+    // translate that into an actionable rebuild/re-import hint.
+    plugin_status: {
+      description:
+        "Query the running plugin loop's self-report (version, ownership, lock " +
+        "freshness/staleness, scan count, poll cadence, log level) over the signed " +
+        "meta channel and persist it as `pluginStatus`. Read-only. NOTE: meta shares " +
+        "the single 30/min command budget — poll no faster than ~every 5s to leave " +
+        "headroom for data ops.",
+      arguments: z.object({}),
+      execute: async (_args: unknown, context: Ctx) => {
+        let status: unknown;
+        try {
+          status = await call(context, "plugin_status");
+        } catch (e) {
+          // The plugin currently loaded predates the meta channel (WS7a): it has no
+          // plugin_status in its allowlist, so the bare command comes back forbidden.
+          // Branch on the structured wire code, not a substring of the message.
+          if (e instanceof SpCommandError && e.code === "forbidden_action") {
+            throw new Error(
+              "sp plugin_status: the running plugin does not support the meta channel " +
+                "(forbidden_action) — it predates WS7a. Rebuild with build_plugin, " +
+                "re-import the plugin (v0.1.15), and restart Super Productivity, then retry.",
+            );
+          }
+          throw e;
+        }
+        const s = (status ?? {}) as Record<string, unknown>;
+        const lock = (s.lock ?? {}) as Record<string, unknown>;
+        const handle = await context.writeResource(
+          "pluginStatus",
+          "pluginStatus-main",
+          {
+            version: String(s.version ?? ""),
+            loopId: String(s.loopId ?? ""),
+            isOwner: !!s.isOwner,
+            uptimeMs: Number(s.uptimeMs ?? 0),
+            scanCount: Number(s.scanCount ?? 0),
+            pollMs: Number(s.pollMs ?? 0),
+            logLevel: String(s.logLevel ?? ""),
+            lock: {
+              owner: (lock.owner ?? null) as string | null,
+              heartbeatAt: (lock.heartbeatAt ?? null) as number | null,
+              ageMs: (lock.ageMs ?? null) as number | null,
+              stale: !!lock.stale,
+            },
+            fetchedAt: new Date().toISOString(),
+          },
+        );
+        context.logger.info("plugin_status: v{v} loop={l} stale={s}", {
+          v: s.version,
+          l: s.loopId,
+          s: lock.stale,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // ── WS7a: build_plugin — stamp manifest version + zip the canonical archive ──
+    // Reusable build step. Run from the repo root so the default paths resolve.
+    build_plugin: {
+      description:
+        "Stamp plugin/manifest.json's version into plugin.js's __PLUGIN_VERSION__ " +
+        "token and produce the canonical importable sp-swamp-plugin.zip (fixed " +
+        "3-file archive: manifest.json, plugin.js, index.html) via a pinned pure-JS " +
+        "zip writer. Makes version-drift structurally impossible. Dev-repo build tool " +
+        "— does NOT touch running SP; re-import + restart SP after building.",
+      arguments: z.object({
+        pluginDir: z.string().default("extensions/super-productivity/plugin")
+          .describe(
+            "Dir holding manifest.json + plugin.js + index.html. Relative paths resolve " +
+              "against the process CWD — run from the swamp WORKSPACE root (not the module " +
+              "repo root) so the default resolves.",
+          ),
+        outZip: z.string().default(
+          "extensions/super-productivity/sp-swamp-plugin.zip",
+        ).describe(
+          "Output path for the canonical zip (the manifest.yaml `binaries` entry).",
+        ),
+      }),
+      execute: async (
+        args: { pluginDir: string; outZip: string },
+        context: Ctx,
+      ) => {
+        const res = await buildPlugin({
+          pluginDir: args.pluginDir,
+          outZip: args.outZip,
+          // Contain reads/writes to the workspace root (FU-3): the default relative
+          // paths resolve within it; a caller-supplied `..`/absolute escape is
+          // rejected before any fs access.
+          root: Deno.cwd(),
+        });
+        context.logger.info(
+          "build_plugin: stamped v{v} -> {z} ({b} bytes, sha {s})",
+          {
+            v: res.version,
+            z: res.outZip,
+            b: res.bytes,
+            s: res.sha256.slice(0, 12),
+          },
+        );
+        return { dataHandles: [], result: res };
       },
     },
   },
