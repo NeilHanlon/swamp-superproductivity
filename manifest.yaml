@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@kneel/super-productivity"
-version: "2026.07.16.5"
+version: "2026.07.18.1"
 description: |
   Make [Super Productivity](https://super-productivity.com/) a node in the swamp
   automation graph — headless task/project/tag reads and writes over a signed
@@ -64,6 +64,8 @@ paths:
 models:
   - super_productivity.ts
   - sp_wire.ts
+skills:
+  - super-productivity
 binaries:
   - sp-swamp-plugin.zip
 additionalFiles:
