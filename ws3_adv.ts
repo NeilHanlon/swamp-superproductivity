@@ -18,8 +18,12 @@ import {
   signBytes,
 } from "./sp_wire.ts";
 
-const BRIDGE =
-  "/home/neil/.var/app/com.super_productivity.SuperProductivity/data/super-productivity-swamp";
+// Bridge dir: override with SP_BRIDGE_DIR, else default under $HOME (no hardcoded
+// personal path). Run with --allow-env (or pass SP_BRIDGE_DIR explicitly).
+const BRIDGE = Deno.env.get("SP_BRIDGE_DIR") ??
+  `${
+    Deno.env.get("HOME") ?? "."
+  }/.var/app/com.super_productivity.SuperProductivity/data/super-productivity-swamp`;
 const CMD_DIR = `${BRIDGE}/plugin_commands`;
 const RSP_DIR = `${BRIDGE}/plugin_responses`;
 

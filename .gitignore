@@ -12,3 +12,9 @@
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks.json
 # END swamp managed section
+
+# Internal working notes — keep out of the public repo. Only the published design
+# doc (referenced by manifest.yaml additionalFiles) is tracked; everything else
+# under docs/ is session scratch (carries local paths / ids) and stays local.
+docs/*
+!docs/super-productivity-plan.md
